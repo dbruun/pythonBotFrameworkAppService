@@ -6,7 +6,7 @@ from typing import Optional
 from botbuilder.core import ActivityHandler, ConversationState, TurnContext
 from botbuilder.schema import ChannelAccount
 
-from azure.ai.projects import AIProjectClient
+from azure.ai.agents import AgentsClient
 from azure.identity import DefaultAzureCredential
 
 logger = logging.getLogger(__name__)
@@ -24,35 +24,28 @@ class FoundryBot(ActivityHandler):
         self.conversation_state = conversation_state
         # Accessor used to persist the Foundry thread ID across turns
         self._thread_id_accessor = conversation_state.create_property("FoundryThreadId")
-        self._project_client: Optional[AIProjectClient] = None
+        self._agents_client: Optional[AgentsClient] = None
 
     # ------------------------------------------------------------------
-    # Azure AI Foundry client (lazy, singleton)
+    # Azure AI Agents client (lazy, singleton)
     # ------------------------------------------------------------------
 
-    def _get_project_client(self) -> AIProjectClient:
-        if self._project_client is not None:
-            return self._project_client
+    def _get_agents_client(self) -> AgentsClient:
+        if self._agents_client is not None:
+            return self._agents_client
 
-        credential = DefaultAzureCredential()
-
-        if self.config.AZURE_AI_PROJECT_CONNECTION_STRING:
-            self._project_client = AIProjectClient.from_connection_string(
-                conn_str=self.config.AZURE_AI_PROJECT_CONNECTION_STRING,
-                credential=credential,
-            )
-        elif self.config.AZURE_AI_PROJECT_ENDPOINT:
-            self._project_client = AIProjectClient(
-                endpoint=self.config.AZURE_AI_PROJECT_ENDPOINT,
-                credential=credential,
-            )
-        else:
+        if not self.config.AZURE_AI_PROJECT_ENDPOINT:
             raise ValueError(
-                "Neither AZURE_AI_PROJECT_CONNECTION_STRING nor "
-                "AZURE_AI_PROJECT_ENDPOINT is configured."
+                "AZURE_AI_PROJECT_ENDPOINT is not configured. "
+                "Set it to your Foundry project endpoint, e.g. "
+                "https://<aiservices-id>.services.ai.azure.com/api/projects/<project-name>."
             )
 
-        return self._project_client
+        self._agents_client = AgentsClient(
+            endpoint=self.config.AZURE_AI_PROJECT_ENDPOINT,
+            credential=DefaultAzureCredential(),
+        )
+        return self._agents_client
 
     # ------------------------------------------------------------------
     # Bot Framework activity handlers
@@ -68,7 +61,7 @@ class FoundryBot(ActivityHandler):
             turn_context, None
         )
 
-        # Offload the synchronous Foundry SDK calls to a thread-pool executor
+        # Offload the synchronous Agents SDK calls to a thread-pool executor
         # so that the asyncio event loop is not blocked.
         loop = asyncio.get_event_loop()
         response_text, thread_id = await loop.run_in_executor(
@@ -103,23 +96,23 @@ class FoundryBot(ActivityHandler):
         (response_text, thread_id).  If *thread_id* is None a new thread
         is created so this conversation starts fresh.
         """
-        client = self._get_project_client()
+        client = self._get_agents_client()
 
         # Create a thread on the first turn of the conversation
         if not thread_id:
-            thread = client.agents.create_thread()
+            thread = client.threads.create()
             thread_id = thread.id
             logger.info("Created new Foundry thread: %s", thread_id)
 
         # Add the user's message to the thread
-        client.agents.create_message(
+        client.messages.create(
             thread_id=thread_id,
             role="user",
             content=message,
         )
 
         # Run the agent and block until it completes
-        run = client.agents.create_and_process_run(
+        run = client.runs.create_and_process(
             thread_id=thread_id,
             agent_id=self.config.AZURE_AI_AGENT_ID,
         )
@@ -136,7 +129,7 @@ class FoundryBot(ActivityHandler):
             )
 
         # Retrieve messages and return the most recent assistant reply
-        messages = client.agents.list_messages(thread_id=thread_id)
+        messages = client.messages.list(thread_id=thread_id)
         for msg in messages:
             if msg.role == "assistant":
                 for content_block in msg.content:
